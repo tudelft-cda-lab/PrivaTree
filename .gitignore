@@ -1,0 +1,5 @@
+*__pycache__*
+out/*
+!out/placeholder.md
+venv/
+.DS_Store
