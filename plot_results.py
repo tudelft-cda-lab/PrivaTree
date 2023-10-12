@@ -17,8 +17,6 @@ for result_type in ["numerical", "categorical", "uci"]:
 
     results_df = pd.read_csv(result_filename)
 
-    depth_3_results = results_df[results_df["max_depth"] == 3]
-
     hue_order = [
         "diffprivlib tree",
         "DPGDT",

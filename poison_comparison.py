@@ -6,35 +6,73 @@ import openml
 import pandas as pd
 from diffprivlib.models import (
     DecisionTreeClassifier as DiffprivLibDecisionTreeClassifier,
+    LogisticRegression as DiffPrivLibLogisticRegression,
 )
 from sklearn.dummy import DummyClassifier
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import StandardScaler
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.utils import check_random_state
 
 from privatree.bdpt import BDPTClassifier
+from privatree.dpa import DPAClassifier
 from privatree.dpgdf import DPGDTClassifier
 from privatree.privatree import PrivaTreeClassifier
 
+def dpa_poison_accuracy_guarantee(poisoning_curve, data_size):
+    n_poison_01 = int(0.001 * data_size)
+    n_poison_05 = int(0.005 * data_size)
+    n_poison_1 = int(0.01 * data_size)
+
+    if n_poison_01 >= len(poisoning_curve):
+        guarantee_01 = 0
+    else:
+        guarantee_01 = poisoning_curve[n_poison_01]
+
+    if n_poison_05 >= len(poisoning_curve):
+        guarantee_05 = 0
+    else:
+        guarantee_05 = poisoning_curve[n_poison_05]
+
+    if n_poison_1 >= len(poisoning_curve):
+        guarantee_1 = 0
+    else:
+        guarantee_1 = poisoning_curve[n_poison_1]
+
+    return guarantee_01, guarantee_05, guarantee_1
+
+def epsilon_poison_accuracy_guarantee(base_accuracy, epsilon, data_size):
+    """Compute a differential privacy guarantee on poison accuracy under 0.5%, 1% and 2% of poison samples."""
+    n_poison_01 = int(0.001 * data_size)
+    n_poison_05 = int(0.005 * data_size)
+    n_poison_1 = int(0.01 * data_size)
+    return (
+        base_accuracy * np.exp(-epsilon * n_poison_01),
+        base_accuracy * np.exp(-epsilon * n_poison_05),
+        base_accuracy * np.exp(-epsilon * n_poison_1),
+    )
+
 max_bins = 10
 max_depths = [4]
-epsilons = [0.01, 0.1, 1.0]
+epsilons = [0.001, 0.01, 0.1, 1.0]
 n_splits = 5
 
 assert len(sys.argv) == 2
 
 benchmark = sys.argv[1]
 
+output_filename_prefix = "out/benchmark_poisoning"
+
 if benchmark == "categorical":
     SUITE_ID = 334  # Classification on numerical and categorical features
-    output_filename = "out/benchmark_results_categorical.csv"
+    output_filename = output_filename_prefix + "_categorical.csv"
 
     benchmark_suite = openml.study.get_suite(SUITE_ID)  # obtain the benchmark suite
 
     task_ids = benchmark_suite.tasks
 elif benchmark == "numerical":
     SUITE_ID = 337  # Classification on numerical features
-    output_filename = "out/benchmark_results_numerical.csv"
+    output_filename = output_filename_prefix + "_numerical.csv"
 
     benchmark_suite = openml.study.get_suite(SUITE_ID)  # obtain the benchmark suite
 
@@ -48,7 +86,7 @@ elif benchmark == "uci":
         959,  # nursery
         1590,  # adult
     ]
-    output_filename = "out/benchmark_results_uci.csv"
+    output_filename = output_filename_prefix + "_uci.csv"
 else:
     raise ValueError(f"Unknown benchmark {benchmark}")
 
@@ -84,9 +122,10 @@ for task_id in task_ids:  # iterate over all tasks
         X_test = X[test_indices]
         y_test = y[test_indices]
 
-        # Separate categorical features for DPGDF
-        X_train_cat = X_train[:, categorical_indicator]
-        X_test_cat = X_test[:, categorical_indicator]
+        # Scale the data for logistic regression
+        scaler = StandardScaler()
+        X_train_lr = scaler.fit_transform(X_train)
+        X_test_lr = scaler.transform(X_test)
 
         # Compute feature ranges on the train data (these are public information)
         feature_range = np.concatenate(
@@ -94,6 +133,7 @@ for task_id in task_ids:  # iterate over all tasks
             axis=1,
         )
         bounds = (feature_range[:, 0], feature_range[:, 1])
+        data_norm = np.linalg.norm(X_train_lr, ord=2, axis=1).max()
 
         # Compute number of categories if they exist (public information)
         categorical_features = []
@@ -104,26 +144,37 @@ for task_id in task_ids:  # iterate over all tasks
                 categorical_features.append(int(X_train[:, feature_i].max() + 1))
         categorical_features = np.array(categorical_features)
 
-        # Train a dummy classifier that predicts the majority class as baseline
-        dummy = DummyClassifier(strategy="most_frequent")
-        dummy.fit(X_train, y_train)
-        dummy_train_accuracy = dummy.score(X_train, y_train)
-        dummy_test_accuracy = dummy.score(X_test, y_test)
-        print("Dummy:", dummy_test_accuracy)
-
-        results.append(
-            (
-                dataset.name,
-                fold_i,
-                "dummy",
-                0,
-                None,
-                None,
-                dummy_train_accuracy,
-                dummy_test_accuracy,
-                None,
+        for epsilon in epsilons:
+            start_time = time.time()
+            logistic_regression = DiffPrivLibLogisticRegression(
+                random_state=random_state,
+                epsilon=epsilon,
+                data_norm=data_norm,
             )
-        )
+            # logistic_regression.fit(X_train, y_train)
+            logistic_regression.fit(X_train_lr, y_train)
+            runtime = time.time() - start_time
+            # train_accuracy = logistic_regression.score(X_train, y_train)
+            # test_accuracy = logistic_regression.score(X_test, y_test)
+            train_accuracy = logistic_regression.score(X_train_lr, y_train)
+            test_accuracy = logistic_regression.score(X_test_lr, y_test)
+            results.append(
+                (
+                    dataset.name,
+                    fold_i,
+                    "logistic regression",
+                    None,
+                    epsilon,
+                    None,
+                    train_accuracy,
+                    test_accuracy,
+                    runtime,
+                    None,
+                    *epsilon_poison_accuracy_guarantee(test_accuracy, epsilon, len(X_train)),
+                )
+            )
+
+            print(results[-1])
 
         for max_depth in max_depths:
             start_time = time.time()
@@ -145,10 +196,46 @@ for task_id in task_ids:  # iterate over all tasks
                     train_accuracy,
                     test_accuracy,
                     runtime,
+                    None,
+                    None,
+                    None,
+                    None,
                 )
             )
 
             print(results[-1])
+
+            for n_partitions in [5, 10, 50, 100, 500, 1000, 5000]:
+                # Skip training if there are too many partitions for the data size
+                if n_partitions > 0.5 * len(X_train):
+                    continue
+
+                start_time = time.time()
+                dpa = DPAClassifier(
+                    n_partitions=n_partitions, max_depth=max_depth, random_state=random_state
+                )
+                dpa.fit(X_train, y_train)
+                runtime = time.time() - start_time
+                train_accuracy = dpa.score(X_train, y_train)
+                test_accuracy = dpa.score(X_test, y_test)
+                poisoning_curve = dpa.poisoning_accuracy_curve(X_test, y_test)
+                results.append(
+                    (
+                        dataset.name,
+                        fold_i,
+                        "DPA",
+                        max_depth,
+                        None,
+                        None,
+                        train_accuracy,
+                        test_accuracy,
+                        runtime,
+                        n_partitions,
+                        *dpa_poison_accuracy_guarantee(poisoning_curve, len(X_train)),
+                    )
+                )
+
+                print(results[-1])
 
             for epsilon in epsilons:
                 start_time = time.time()
@@ -174,6 +261,8 @@ for task_id in task_ids:  # iterate over all tasks
                         train_accuracy,
                         test_accuracy,
                         runtime,
+                        None,
+                        *epsilon_poison_accuracy_guarantee(test_accuracy, epsilon, len(X_train)),
                     )
                 )
 
@@ -196,134 +285,17 @@ for task_id in task_ids:  # iterate over all tasks
                     (
                         dataset.name,
                         fold_i,
-                        "private tree",
+                        "PrivaTree",
                         max_depth,
                         epsilon,
                         max_bins,
                         train_accuracy,
                         test_accuracy,
                         runtime,
+                        None,
+                        *epsilon_poison_accuracy_guarantee(test_accuracy, epsilon, len(X_train)),
                     )
                 )
-
-                print(results[-1])
-
-                start_time = time.time()
-                private_tree = PrivaTreeClassifier(
-                    max_depth=max_depth,
-                    max_bins=max_bins,
-                    epsilon=epsilon,
-                    feature_range=feature_range,
-                    categorical_features=categorical_features,
-                    use_private_quantiles=False,
-                    random_state=random_state,
-                )
-                private_tree.fit(X_train, y_train)
-                runtime = time.time() - start_time
-                train_accuracy = private_tree.score(X_train, y_train)
-                test_accuracy = private_tree.score(X_test, y_test)
-                results.append(
-                    (
-                        dataset.name,
-                        fold_i,
-                        "private tree (non-priv. quantiles)",
-                        max_depth,
-                        epsilon,
-                        max_bins,
-                        train_accuracy,
-                        test_accuracy,
-                        runtime,
-                    )
-                )
-
-                print(results[-1])
-
-                # For DPGDF we train on categorical features only as the algorithm
-                # does not support numerical features (same as Borhan, 2018)
-                if X_train_cat.shape[1] == 0:
-                    results.append(
-                        (
-                            dataset.name,
-                            fold_i,
-                            "DPGDT",
-                            max_depth,
-                            epsilon,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    )
-                else:
-                    start_time = time.time()
-                    dpgd_tree = DPGDTClassifier(
-                        max_depth=max_depth,
-                        epsilon=epsilon,
-                        feature_range=feature_range,
-                        categorical_features=True,
-                        random_state=random_state,
-                    )
-                    dpgd_tree.fit(X_train_cat, y_train)
-                    runtime = time.time() - start_time
-                    train_accuracy = dpgd_tree.score(X_train_cat, y_train)
-                    test_accuracy = dpgd_tree.score(X_test_cat, y_test)
-                    results.append(
-                        (
-                            dataset.name,
-                            fold_i,
-                            "DPGDT",
-                            max_depth,
-                            epsilon,
-                            None,
-                            train_accuracy,
-                            test_accuracy,
-                            runtime,
-                        )
-                    )
-
-                print(results[-1])
-
-                if dataset.name.lower() == "higgs":
-                    # This algorithm takes too long to run on higgs (> 2 hours)
-                    results.append(
-                        (
-                            dataset.name,
-                            fold_i,
-                            "BDPT",
-                            max_depth,
-                            epsilon,
-                            None,
-                            None,
-                            None,
-                            None,
-                        )
-                    )
-                else:
-                    start_time = time.time()
-                    bdpt_tree = BDPTClassifier(
-                        max_depth=max_depth,
-                        epsilon=epsilon,
-                        feature_range=feature_range,
-                        categorical_features=categorical_features,
-                        random_state=random_state,
-                    )
-                    bdpt_tree.fit(X_train, y_train)
-                    runtime = time.time() - start_time
-                    train_accuracy = bdpt_tree.score(X_train, y_train)
-                    test_accuracy = bdpt_tree.score(X_test, y_test)
-                    results.append(
-                        (
-                            dataset.name,
-                            fold_i,
-                            "BDPT",
-                            max_depth,
-                            epsilon,
-                            None,
-                            train_accuracy,
-                            test_accuracy,
-                            runtime,
-                        )
-                    )
 
                 print(results[-1])
 
@@ -339,6 +311,10 @@ for task_id in task_ids:  # iterate over all tasks
                         "train accuracy",
                         "test accuracy",
                         "runtime",
+                        "n_partitions",
+                        "0.1% guarantee",
+                        "0.5% guarantee",
+                        "1% guarantee",
                     ],
                 )
                 results_df.to_csv(output_filename, index=False)

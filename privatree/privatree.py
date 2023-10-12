@@ -530,7 +530,7 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
         return node
 
     def __create_leaf(self, y):
-        counts = list(np.bincount(y, minlength=2))
+        counts = list(np.bincount(y, minlength=len(self.classes_)))
         mech = PermuteAndFlip(
             epsilon=self.leaf_epsilon_,
             sensitivity=1,
@@ -546,12 +546,14 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
             else:
                 print(f"Leaf with counts={counts} gets correct label ({chosen_label})")
 
-        value = np.array([1 - chosen_label, chosen_label])
+        value = np.zeros(len(self.classes_))
+        value[chosen_label] = 1
         return Node(_TREE_UNDEFINED, _TREE_LEAF, _TREE_LEAF, value)
 
     def __find_best_split(self, X, y, depth):
-        X_0 = X[y == 0]
-        X_1 = X[y == 1]
+        X_by_class = {}
+        for label in self.classes_:
+            X_by_class[label] = X[y == label]
 
         best_gini = float("inf")
         best_feature = None
@@ -564,61 +566,76 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
             else:
                 node_epsilon = self.node_num_epsilon_
 
-            hist_0 = private_bincount(
-                X_0[:, feature_i],
-                n_bins=n_bins,
-                epsilon=node_epsilon,
-                random_state=self.random_state_,
-            )
-            hist_1 = private_bincount(
-                X_1[:, feature_i],
-                n_bins=n_bins,
-                epsilon=node_epsilon,
-                random_state=self.random_state_,
-            )
+            # TODO: change from dict to numpy array
+
+            histograms = {}
+            for label in self.classes_:
+                histograms[label] = private_bincount(
+                    X_by_class[label][:, feature_i],
+                    n_bins=n_bins,
+                    epsilon=node_epsilon,
+                    random_state=self.random_state_,
+                )
 
             if self.binner_.categorical_features_[feature_i]:
-                hist_total = hist_0 + hist_1
+                # NOTE: this method is only supported for binary classification.
+                # Currently we do not handle multiclass categorical settings
+                if len(self.classes_) != 2:
+                    raise NotImplementedError(
+                        "Multiclass categorical datasets are not yet supported"
+                    )
+
+                hist_total = np.array(
+                    [histograms[label] for label in self.classes_]
+                ).sum(axis=0)
                 class_1_p = np.ones(n_bins) * 0.5
-                np.divide(hist_1, hist_total, out=class_1_p, where=(hist_total != 0))
+                np.divide(
+                    histograms[self.classes_[1]],
+                    hist_total,
+                    out=class_1_p,
+                    where=(hist_total != 0),
+                )
                 bin_order = np.argsort(class_1_p)
             else:
                 bin_order = np.arange(self.n_bins_[feature_i])
 
-            hist_0 = hist_0[bin_order]
-            hist_1 = hist_1[bin_order]
+            for label in self.classes_:
+                histograms[label] = histograms[label][bin_order]
 
-            l_0 = 0
-            l_1 = 0
-            r_0 = np.sum(hist_0)
-            r_1 = np.sum(hist_1)
-            for bin_i, (count_0, count_1) in enumerate(zip(hist_0, hist_1)):
-                l_0 += count_0
-                r_0 -= count_0
-                l_1 += count_1
-                r_1 -= count_1
+            left_counts = np.zeros(len(self.classes_), dtype=int)
+            right_counts = np.zeros(len(self.classes_), dtype=int)
+            for i in range(len(self.classes_)):
+                right_counts[i] = histograms[self.classes_[i]].sum()
+
+            for bin_i in range(len(bin_order)):
+                for class_i, label in enumerate(self.classes_):
+                    left_counts[class_i] += histograms[label][bin_i]
+                    right_counts[class_i] -= histograms[label][bin_i]
+
+                total_left = left_counts.sum()
+                total_right = right_counts.sum()
 
                 # Do not consider a split here if that would create a small leaf
                 if (
-                    l_0 + l_1 < self.min_samples_leaf
-                    or r_0 + r_1 < self.min_samples_leaf
+                    total_left < self.min_samples_leaf
+                    or total_right < self.min_samples_leaf
                 ):
                     continue
 
-                if l_0 + l_1 == 0:
+                if total_left == 0:
                     gini_l = 0
                 else:
-                    denom = (l_0 + l_1) ** 2
-                    gini_l = 1 - (l_0**2) / denom - (l_1**2) / denom
+                    denom = total_left**2
+                    gini_l = 1 - np.square(left_counts).sum() / denom
 
-                if r_0 + r_1 == 0:
+                if total_right == 0:
                     gini_r = 0
                 else:
-                    denom = (r_0 + r_1) ** 2
-                    gini_r = 1 - (r_0**2) / denom - (r_1**2) / denom
+                    denom = total_right**2
+                    gini_r = 1 - np.square(right_counts).sum() / denom
 
-                gini = ((l_0 + l_1) * gini_l + (r_0 + r_1) * gini_r) / (
-                    l_0 + l_1 + r_0 + r_1
+                gini = ((total_left) * gini_l + (total_right) * gini_r) / (
+                    total_left + total_right
                 )
 
                 if gini < best_gini:
