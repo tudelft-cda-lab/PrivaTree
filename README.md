@@ -1,7 +1,7 @@
 # PrivaTree: An algorithm for training differentially-private decision trees
 This library contains the implementation of PrivaTree and several other methods for training differentially-private decision trees for binary classification. These models protect the model from leaking information about training data in exchange for a potential drop in utility. This privacy-utility trade-off is decided by a parameter $\epsilon > 0$, where $\epsilon = \infty$ achieves no privacy but high utility, and lower numbers achieve more privacy. PrivaTree consistently outperforms other methods as it uses the privacy budget set by $\epsilon$ more efficiently than other works, and finds a balance between making accurate splits and generating accurate leaf labels.
 
-_PrivaTree was developed and implemented by Daniël Vos with the help of Jelle Vos, Tianyu Li, Zekeriya Erkin, and Sicco Verwer. The accompanying paper can be found on [arxiv]()._
+_PrivaTree was developed and implemented by Daniël Vos with the help of Jelle Vos, Tianyu Li, Zekeriya Erkin, and Sicco Verwer. The accompanying paper can be found on [arxiv](https://arxiv.org/abs/2305.15394)._
 
 ## Installing
 To install the required dependencies run (preferably in a virtual environment):
