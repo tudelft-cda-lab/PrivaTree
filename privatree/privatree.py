@@ -211,13 +211,16 @@ class PrivateBinner(BaseEstimator, TransformerMixin):
         epsilon=1.0,
         feature_range=None,
         categorical_features=None,
+        use_uniform_bins=True,
         use_private_quantiles=True,
         random_state=None,
     ):
         self.max_bins = max_bins
         self.epsilon = epsilon
+
         self.feature_range = feature_range
         self.categorical_features = categorical_features
+        self.use_uniform_bins = use_uniform_bins
         self.use_private_quantiles = use_private_quantiles
         self.random_state = random_state
 
@@ -288,19 +291,23 @@ class PrivateBinner(BaseEstimator, TransformerMixin):
                 self.n_bins_.append(n_categories)
             else:
                 if self.use_private_quantiles:
-                    bins = np.unique(
-                        list(
-                            private_quantiles(
-                                sorted_data=sorted(X[:, feature_i]),
-                                data_low=self.feature_range_[feature_i][0],
-                                data_high=self.feature_range_[feature_i][1],
-                                qs=quantiles[1:-1],
-                                eps=self.epsilon,
-                                random_state=self.random_state_,
+                    if self.use_uniform_bins:
+                        bins = np.linspace(self.feature_range_[feature_i][0], self.feature_range_[feature_i][1], self.max_bins + 1)[1:]
+                    else:
+                        bins = np.unique(
+                            list(
+                                private_quantiles(
+                                    sorted_data=sorted(X[:, feature_i]),
+                                    data_low=self.feature_range_[feature_i][0],
+                                    data_high=self.feature_range_[feature_i][1],
+                                    qs=quantiles[1:-1],
+                                    eps=self.epsilon,
+                                    random_state=self.random_state_,
+                                )
                             )
+                            + [self.feature_range_[feature_i][1]]
                         )
-                        + [self.feature_range_[feature_i][1]]
-                    )
+
                     self.feature_to_bin_info_.append(bins)
                     self.n_bins_.append(len(bins))
                 else:
@@ -377,6 +384,7 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
         epsilon_shares="auto",
         leaf_label_success_prob=0.99,
         max_leaf_epsilon_share=0.5,
+        use_uniform_bins=True,
         use_private_quantiles=True,
         verbose=False,
         random_state=None,
@@ -391,6 +399,7 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
         self.epsilon_shares = epsilon_shares
         self.leaf_label_success_prob = leaf_label_success_prob
         self.max_leaf_epsilon_share = max_leaf_epsilon_share
+        self.use_uniform_bins = use_uniform_bins
         self.use_private_quantiles = use_private_quantiles
         self.verbose = verbose
         self.random_state = random_state
@@ -410,9 +419,10 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
 
         self.binner_ = PrivateBinner(
             max_bins=self.max_bins,
-            epsilon=self.quantile_epsilon_,
+            epsilon=self.quantile_epsilon_ / self.n_features_in_, # Correction for sequential mechanism
             feature_range=self.feature_range,
             categorical_features=self.categorical_features,
+            use_uniform_bins=self.use_uniform_bins,
             use_private_quantiles=self.use_private_quantiles,
             random_state=self.random_state_,
         )
@@ -439,11 +449,29 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
                 print("total epsilon budget:", self.epsilon)
 
             if self.use_private_quantiles:
-                self.quantile_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
-                    self.max_depth + 1
-                )
+                # self.quantile_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
+                #     self.max_depth + 1
+                # )
+                # self.node_num_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
+                #     self.max_depth + 1
+                # )
+                # self.node_cat_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
+                #     self.max_depth
+                # )
+
+                # self.quantile_epsilon_ = self.n_features_in_ * (self.epsilon - self.leaf_epsilon_) / (
+                #     self.max_depth + self.n_features_in_
+                # )
+                # self.node_num_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
+                #     self.max_depth + self.n_features_in_
+                # )
+                # self.node_cat_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
+                #     self.max_depth
+                # )
+
+                self.quantile_epsilon_ = 0
                 self.node_num_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
-                    self.max_depth + 1
+                    self.max_depth
                 )
                 self.node_cat_epsilon_ = (self.epsilon - self.leaf_epsilon_) / (
                     self.max_depth
@@ -495,10 +523,15 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
             print("leaves:", self.leaf_epsilon_)
 
     def __fit_recursive(self, X_binned, y, depth=0):
+        # if (
+        #     depth == self.max_depth
+        #     or len(np.unique(y)) == 1
+        #     or len(X_binned) < self.min_samples_split
+        # ):
+        #     return self.__create_leaf(y)
+
         if (
             depth == self.max_depth
-            or len(np.unique(y)) == 1
-            or len(X_binned) < self.min_samples_split
         ):
             return self.__create_leaf(y)
 
@@ -555,49 +588,24 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
         for label in self.classes_:
             X_by_class[label] = X[y == label]
 
-        best_gini = float("inf")
-        best_feature = None
-        best_bin = None
+        ginis = []
+        features = []
+        bins = []
+        bin_orders = []
         for feature_i in range(X.shape[1]):
             n_bins = self.n_bins_[feature_i]
-
-            if self.binner_.categorical_features_[feature_i]:
-                node_epsilon = self.node_cat_epsilon_
-            else:
-                node_epsilon = self.node_num_epsilon_
 
             # TODO: change from dict to numpy array
 
             histograms = {}
             for label in self.classes_:
-                histograms[label] = private_bincount(
+                # Now we do non-private histograms and add noise during split selection
+                histograms[label] = np.bincount(
                     X_by_class[label][:, feature_i],
-                    n_bins=n_bins,
-                    epsilon=node_epsilon,
-                    random_state=self.random_state_,
+                    minlength=n_bins,
                 )
 
-            if self.binner_.categorical_features_[feature_i]:
-                # NOTE: this method is only supported for binary classification.
-                # Currently we do not handle multiclass categorical settings
-                if len(self.classes_) != 2:
-                    raise NotImplementedError(
-                        "Multiclass categorical datasets are not yet supported"
-                    )
-
-                hist_total = np.array(
-                    [histograms[label] for label in self.classes_]
-                ).sum(axis=0)
-                class_1_p = np.ones(n_bins) * 0.5
-                np.divide(
-                    histograms[self.classes_[1]],
-                    hist_total,
-                    out=class_1_p,
-                    where=(hist_total != 0),
-                )
-                bin_order = np.argsort(class_1_p)
-            else:
-                bin_order = np.arange(self.n_bins_[feature_i])
+            bin_order = np.arange(self.n_bins_[feature_i])
 
             for label in self.classes_:
                 histograms[label] = histograms[label][bin_order]
@@ -615,13 +623,6 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
                 total_left = left_counts.sum()
                 total_right = right_counts.sum()
 
-                # Do not consider a split here if that would create a small leaf
-                if (
-                    total_left < self.min_samples_leaf
-                    or total_right < self.min_samples_leaf
-                ):
-                    continue
-
                 if total_left == 0:
                     gini_l = 0
                 else:
@@ -634,17 +635,41 @@ class PrivaTreeClassifier(BaseEstimator, ClassifierMixin):
                     denom = total_right**2
                     gini_r = 1 - np.square(right_counts).sum() / denom
 
-                gini = ((total_left) * gini_l + (total_right) * gini_r) / (
-                    total_left + total_right
-                )
+                if total_left == 0 and total_right == 0:
+                    gini = 0.5
+                else:
+                    gini = ((total_left) * gini_l + (total_right) * gini_r) / (
+                        total_left + total_right
+                    )
 
-                if gini < best_gini:
-                    best_gini = gini
-                    best_feature = feature_i
-                    best_bin = bin_i
-                    best_bin_order = bin_order
+                ginis.append(gini)
+                features.append(feature_i)
+                bins.append(bin_i)
+                bin_orders.append(bin_order)
+        
+        # Flip all Gini scores so that we minimize instead of maximize
+        utility = [0.5 - gini for gini in ginis]
+        mech = GeometricTruncated(
+            epsilon=self.node_num_epsilon_ * 0.5,
+            sensitivity=1,
+            lower=1,
+            upper=maxsize,
+            random_state=self.random_state_,
+        )
+        n = mech.randomise(len(X))
+        sensitivity = 1 - (n / (n + 1)) ** 2 - (1 / (n + 1)) ** 2
+        mech = PermuteAndFlip(
+            epsilon=self.node_num_epsilon_ * 0.5,
+            sensitivity=sensitivity,
+            utility=utility,
+            random_state=self.random_state_,
+        )
+        selected_i = mech.randomise()
 
-        return best_feature, best_bin_order, best_bin, best_gini
+        if self.verbose:
+            print(f"selected utility: {utility[selected_i]}")
+
+        return features[selected_i], bin_orders[selected_i], bins[selected_i], ginis[selected_i]
 
     def predict_proba(self, X):
         X = check_array(X)

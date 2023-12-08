@@ -40,6 +40,7 @@ def tree_score(epsilon_shares, repetitions=50):
             max_bins=10,
             categorical_features=categorical_indicator,
             epsilon_shares=epsilon_shares,
+            use_uniform_bins=False,
             random_state=random_state,
         )
         tree.fit(X, y)

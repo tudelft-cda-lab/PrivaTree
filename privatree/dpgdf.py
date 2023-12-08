@@ -126,8 +126,6 @@ class DPGDTClassifier(BaseEstimator, ClassifierMixin):
     def __fit_recursive(self, X, y, depth=0, previous_splits=[]):
         if (
             depth == self.max_depth
-            or len(np.unique(y)) == 1
-            or len(X) < self.min_samples_split
         ):
             return self.__create_leaf(y)
 
@@ -245,9 +243,12 @@ class DPGDTClassifier(BaseEstimator, ClassifierMixin):
                         denom = (r_0 + r_1) ** 2
                         gini_r = 1 - (r_0**2) / denom - (r_1**2) / denom
 
-                    gini = ((l_0 + l_1) * gini_l + (r_0 + r_1) * gini_r) / (
-                        l_0 + l_1 + r_0 + r_1
-                    )
+                    if l_0 + l_1 + r_0 + r_1 == 0:
+                        gini = 0.5
+                    else:
+                        gini = ((l_0 + l_1) * gini_l + (r_0 + r_1) * gini_r) / (
+                            l_0 + l_1 + r_0 + r_1
+                        )
 
                     gini_scores.append(gini)
                     features.append(feature_i)
